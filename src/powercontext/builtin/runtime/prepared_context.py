@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
-from itertools import chain
+from dataclasses import dataclass, field, replace
+from itertools import chain, pairwise
 from typing import TypeVar
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
@@ -104,8 +107,9 @@ class PreparedContextBuild:
 
     context: PreparedContext
     origins: tuple[PreparedContextOrigin, ...]
-    omissions: PreparedContextOmissions = PreparedContextOmissions()
+    omissions: PreparedContextOmissions = field(default_factory=PreparedContextOmissions)
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedEvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,22 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedEvidenceFragment:
+    """One literal, precisely addressable character span from a Memory entry."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+    def __post_init__(self) -> None:
+        if type(self.start) is not int or type(self.end) is not int or not 0 <= self.start < self.end:
+            raise ValueError("fragment offsets must be non-negative increasing integers")  # noqa: TRY003
+        if not self.text or len(self.text) != self.end - self.start:
+            raise ValueError("fragment text must not be empty")  # noqa: TRY003
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -211,6 +231,8 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return self._build_evidence_selection(request, memory_candidates)
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -254,6 +276,32 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _build_evidence_selection(
+        self,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
+            raise PreparedContextInvariantError("memory-candidate-limit")
+        candidates = _evidence_fragment_candidates(request.query, memory_candidates)
+        selected: list[PreparedEvidenceFragment] = []
+        for _score, fragment in candidates:
+            if len(selected) >= self.entry_limit:
+                break
+            if _fragment_overlaps(selected, fragment):
+                continue
+            proposed = (*selected, fragment)
+            if len(_render_fragments(proposed).encode("utf-8")) <= request.max_bytes:
+                selected.append(fragment)
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        content = _render_fragments(selected)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=tuple(fragment.address for fragment in selected),
+            fragments=tuple(selected),
         )
 
     def probe_budget(
@@ -683,6 +731,192 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     for index in range(max((len(group) for group in groups), default=0)):
         ordered.extend(group[index] for group in groups if index < len(group))
     return tuple(ordered)
+
+
+_EVIDENCE_STOP_WORDS = frozenset({
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+})
+
+
+def _evidence_fragment_candidates(
+    query: str,
+    groups: Sequence[PreparedMemoryCandidates],
+) -> tuple[tuple[float, PreparedEvidenceFragment], ...]:
+    query_terms = Counter(_normalized_terms(query))
+    rows: list[tuple[int, MemoryEntryAddress, str, tuple[tuple[int, int], ...]]] = []
+    rank = 0
+    for group in groups:
+        if group.hits and group.memory_ref is None:
+            raise PreparedContextInvariantError("memory-ref-missing")
+        for hit in group.hits:
+            rank += 1
+            if hit.memory_ref != group.memory_ref:
+                raise PreparedContextInvariantError("memory-ref-mismatch")
+            if not hit.text.strip():
+                continue
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            spans = _sentence_spans(hit.text)
+            rows.append((rank, address, hit.text, spans))
+
+    sentence_terms = [
+        set(_normalized_terms(text[start:end])) for _rank, _address, text, spans in rows for start, end in spans
+    ]
+    document_frequency = Counter(term for terms in sentence_terms for term in terms)
+    sentence_count = max(1, len(sentence_terms))
+    scored: list[tuple[float, PreparedEvidenceFragment]] = []
+    for rank, address, text, spans in rows:
+        span_scores = [
+            _lexical_evidence_score(
+                query_terms,
+                _normalized_terms(text[start:end]),
+                document_frequency,
+                sentence_count,
+            )
+            for start, end in spans
+        ]
+        for index, (start, end) in enumerate(spans):
+            score = span_scores[index] + 0.01 / rank
+            scored.append((score, PreparedEvidenceFragment(address, start, end, text[start:end])))
+            if index + 1 < len(spans) and (span_scores[index] > 0 or span_scores[index + 1] > 0):
+                pair_end = spans[index + 1][1]
+                pair_score = span_scores[index] + span_scores[index + 1] + 0.02 / rank
+                scored.append((pair_score, PreparedEvidenceFragment(address, start, pair_end, text[start:pair_end])))
+    scored.sort(key=lambda item: (-item[0], item[1].address.memory.scope_id, item[1].start, item[1].end))
+    return tuple(scored)
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    boundaries = [0]
+    boundaries.extend(match.end() for match in re.finditer(r"(?<=[.!?])\s+|\n+", text))
+    boundaries.append(len(text))
+    spans: list[tuple[int, int]] = []
+    for left, right in pairwise(boundaries):
+        while left < right and text[left].isspace():
+            left += 1
+        while right > left and text[right - 1].isspace():
+            right -= 1
+        if left < right:
+            spans.append((left, right))
+    return tuple(spans) or ((0, len(text)),)
+
+
+def _normalized_terms(text: str) -> tuple[str, ...]:
+    return tuple(
+        normalized
+        for token in re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
+        if token not in _EVIDENCE_STOP_WORDS and (normalized := _stem_term(token))
+    )
+
+
+def _stem_term(term: str) -> str:
+    if not term.isascii() or len(term) < 4:
+        return term
+    for suffix in (
+        "ization",
+        "ational",
+        "fulness",
+        "iveness",
+        "ments",
+        "ingly",
+        "edly",
+        "ation",
+        "ities",
+        "ative",
+        "itive",
+        "ing",
+        "ied",
+        "ies",
+        "ive",
+        "ion",
+        "ed",
+        "es",
+        "s",
+    ):
+        if term.endswith(suffix) and len(term) - len(suffix) >= 3:
+            return term[: -len(suffix)] + ("y" if suffix in {"ied", "ies"} else "")
+    return term
+
+
+def _lexical_evidence_score(
+    query: Counter[str],
+    terms: tuple[str, ...],
+    document_frequency: Counter[str],
+    sentence_count: int,
+) -> float:
+    counts = Counter(terms)
+    score = 0.0
+    for term, query_count in query.items():
+        if term in counts:
+            inverse_frequency = math.log((sentence_count + 1) / (document_frequency[term] + 1)) + 1.0
+            score += inverse_frequency * min(query_count, counts[term])
+            continue
+        related = next((candidate for candidate in counts if _shared_prefix(term, candidate) >= 5), None)
+        if related is not None:
+            inverse_frequency = math.log((sentence_count + 1) / (document_frequency[related] + 1)) + 1.0
+            score += 0.6 * inverse_frequency * min(query_count, counts[related])
+    return score / math.sqrt(max(1, len(terms)))
+
+
+def _shared_prefix(left: str, right: str) -> int:
+    return next(
+        (index for index, pair in enumerate(zip(left, right, strict=False)) if pair[0] != pair[1]),
+        min(len(left), len(right)),
+    )
+
+
+def _fragment_overlaps(selected: Sequence[PreparedEvidenceFragment], candidate: PreparedEvidenceFragment) -> bool:
+    return any(
+        fragment.address == candidate.address and candidate.start < fragment.end and fragment.start < candidate.end
+        for fragment in selected
+    )
+
+
+def _render_fragments(fragments: Sequence[PreparedEvidenceFragment]) -> str:
+    items = []
+    for fragment in fragments:
+        address = fragment.address
+        items.append({
+            "citation": {
+                "scope_id": address.memory.scope_id,
+                "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                "entry_id": address.entry_id,
+                "entry_version_id": address.entry_version_id,
+            },
+            "content": fragment.text,
+            "start": fragment.start,
+            "end": fragment.end,
+        })
+    encoded = json.dumps({"trust": "untrusted_history", "items": items}, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:
