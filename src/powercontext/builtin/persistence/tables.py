@@ -1022,6 +1022,61 @@ TOPIC_MEMORY_TABLES = (
     TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
 )
 
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("kind", identity_string(16), nullable=False),
+    Column("reference", Text, nullable=False),
+    Column("lifecycle_revision", Integer),
+    Column("policy", identity_string(8)),
+    Column("available", Boolean, nullable=False),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="CASCADE"),
+    CheckConstraint("kind IN ('source', 'memory', 'topic')", name="ck_pc_source_lifecycle_nodes_kind"),
+    CheckConstraint("policy IS NULL OR policy IN ('all', 'any')", name="ck_pc_source_lifecycle_nodes_policy"),
+)
+
+SOURCE_LIFECYCLE_EDGES_TABLE = Table(
+    "pc_source_lifecycle_edges",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("parent_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    ForeignKeyConstraint(
+        ("scope_id", "node_id"),
+        ("pc_source_lifecycle_nodes.scope_id", "pc_source_lifecycle_nodes.node_id"),
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ("scope_id", "parent_id"),
+        ("pc_source_lifecycle_nodes.scope_id", "pc_source_lifecycle_nodes.node_id"),
+        ondelete="RESTRICT",
+    ),
+)
+
+SOURCE_LIFECYCLE_EVENTS_TABLE = Table(
+    "pc_source_lifecycle_events",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("sequence", Integer, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("reason", Text, nullable=False),
+    ForeignKeyConstraint(
+        ("scope_id", "node_id"),
+        ("pc_source_lifecycle_nodes.scope_id", "pc_source_lifecycle_nodes.node_id"),
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("sequence > 0", name="ck_pc_source_lifecycle_events_sequence_positive"),
+)
+
+SOURCE_LIFECYCLE_TABLES = (
+    SOURCE_LIFECYCLE_NODES_TABLE,
+    SOURCE_LIFECYCLE_EDGES_TABLE,
+    SOURCE_LIFECYCLE_EVENTS_TABLE,
+)
+
 # OceanBase requires FK column lengths to match the parent. A normalized-key
 # fingerprint keeps composite indexes within 3072 bytes without narrowing any
 # Unicode identity or label. Queries also compare the full key, not just its hash.
@@ -1184,6 +1239,7 @@ BUILTIN_TABLES = (
     SCOPE_TABLES
     + SHARED_TABLES
     + TOPIC_MEMORY_TABLES
+    + SOURCE_LIFECYCLE_TABLES
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES

@@ -2682,6 +2682,10 @@ class ScopedTopicMemoryApplication:
                     embedding_timeout_seconds,
                 )
         observer = self._runtime._topic_memory_search_observer
+        available = await self._runtime.lifecycle.for_scope(self.scope_id).available_topic_refs(
+            tuple(hit.artifact_ref for hit in result.hits)
+        )
+        result = result.model_copy(update={"hits": tuple(hit for hit in result.hits if hit.artifact_ref in available)})
         if observer is not None:
             try:
                 observer(result.mode, used_fallback)
@@ -3130,6 +3134,9 @@ class BuiltinRuntime:
         self.skill = SkillApplication(self)
         self.remote_skills = RemoteSkillApplication(self)
         self.statistics = StatisticsApplication(self)
+        from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+
+        self.lifecycle = SourceLifecycleApplication(self, provider.database)
         self.handoff_report: HandoffReportApplication | None = None
         self.artifact_processing_supervisor: ArtifactProcessingSupervisors | None = None
         self.processor = None if scope_ids is None else ScheduledSourceProcessor(self, scope_ids)
