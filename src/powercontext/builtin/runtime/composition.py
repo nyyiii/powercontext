@@ -86,6 +86,7 @@ from powercontext.builtin.persistence.oceanbase.experience_index import OceanBas
 from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryFTSIndex,
     OceanBaseMemoryVectorIndex,
+    SeekDBHybridMemoryIndex,
 )
 from powercontext.builtin.persistence.oceanbase.profile import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.oceanbase.topic_memory_index import (
@@ -977,10 +978,7 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
-    if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+    index = _mysql_memory_index(database, embedding_model)
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))
@@ -1864,6 +1862,18 @@ def _search_modes(capabilities: MemoryCapabilities) -> tuple[MemorySearchMode, .
     if capabilities.hybrid:
         modes.append("hybrid")
     return tuple(modes)
+
+
+def _mysql_memory_index(
+    database: OceanBaseConfig | SeekDBConfig,
+    embedding_model: EmbeddingModel | None,
+) -> MemoryIndex:
+    if isinstance(database, SeekDBConfig) and embedding_model is not None:
+        return SeekDBHybridMemoryIndex(embedding_model.profile)
+    indexes: list[MemoryIndex] = [OceanBaseMemoryFTSIndex()]
+    if embedding_model is not None:
+        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
+    return CompositeMemoryIndex(*indexes)
 
 
 __all__ = ["BuiltinConfigurationError", "open_builtin_contexts", "open_builtin_runtime", "preflight_builtin_runtime"]
